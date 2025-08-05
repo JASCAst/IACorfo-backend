@@ -125,7 +125,7 @@ def limpiar_contexto(data: dict) -> dict:
         "contexto_previo": contexto
     }
 
-def limitar_contexto(contexto_previo: list, max_length: int = 3) -> list:
+def limitar_contexto(contexto_previo: list, max_length: int = 6) -> list:
     # Mientras la longitud sea mayor que max_length, elimina el primer elemento
     while len(contexto_previo) > max_length:
         contexto_previo.pop(0)
@@ -140,7 +140,7 @@ async def analyze_question_endpoint(
     data_limpio = limpiar_contexto(data_dict)
     
     if "contexto_previo" in data_limpio:
-        data_limpio["contexto_previo"] = limitar_contexto(data_limpio["contexto_previo"], 3)
+        data_limpio["contexto_previo"] = limitar_contexto(data_limpio["contexto_previo"], 6)
         
     # ETAPA 1: PLANIFICACIÓN
     logger.info(f"Creando plan para la pregunta: '{request.user_question}'")
