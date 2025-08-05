@@ -116,14 +116,26 @@ def merge_timeseries_data_for_chart(collected_data: dict, plan: dict) -> dict:
             
     return collected_data
 
+def limpiar_contexto(data: dict) -> dict:
+    contexto = data.get("contexto_previo", [])
+    for mensaje in contexto:
+        mensaje.pop("audioBase64", None)
+    return {
+        "user_question": data.get("user_question"),
+        "contexto_previo": contexto
+    }
+
 @router.post("/analyze-question/", response_model=FinalResponse)
 async def analyze_question_endpoint(
     request: QuestionRequest, 
     db: Session = Depends(get_db)):
     
+    data_dict = request.dict()
+    data_limpio = limpiar_contexto(data_dict)
+        
     # ETAPA 1: PLANIFICACIÓN
     logger.info(f"Creando plan para la pregunta: '{request.user_question}'")
-    plan = await create_execution_plan(request.user_question, request.center_id, request.contexto_previo)
+    plan = await create_execution_plan(request.user_question, request.center_id, data_limpio['contexto_previo'])
     
     if not plan or "error" in plan:
         raise HTTPException(status_code=500, detail=f"No se pudo crear un plan de ejecución válido: {plan.get('details', 'Error desconocido')}")
