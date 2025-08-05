@@ -2,6 +2,8 @@ import json
 import re
 import base64
 import logging
+import os
+from pymongo import MongoClient
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from openai import AsyncAzureOpenAI
@@ -11,9 +13,15 @@ from app.core.config import settings
 from .models import QuestionRequest, FinalResponse, ChartData
 from .llm_orchestrator import create_execution_plan, synthesize_response
 from .data_tools import ToolExecutor
+from pydantic import BaseModel
+
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# coleccion de pregruntas
+mongo_db = MongoClient(os.getenv("MONGO_URI"))
+wisensor_db = mongo_db["wisensor_db"]
 
 # Cliente para Text-to-Speech (TTS)
 try:
@@ -109,7 +117,10 @@ def merge_timeseries_data_for_chart(collected_data: dict, plan: dict) -> dict:
     return collected_data
 
 @router.post("/analyze-question/", response_model=FinalResponse)
-async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depends(get_db)):
+async def analyze_question_endpoint(
+    request: QuestionRequest, 
+    db: Session = Depends(get_db)):
+    
     # ETAPA 1: PLANIFICACIÓN
     logger.info(f"Creando plan para la pregunta: '{request.user_question}'")
     plan = await create_execution_plan(request.user_question, request.center_id, request.contexto_previo)
@@ -231,9 +242,42 @@ async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depe
         except Exception as e:
             logger.error(f"Error al generar audio: {e}")
     logger.info(f"respuesta: {final_text}, chart: {final_chart_object}, audio_base64: {audio_base64}, contexto={collected_data}")
+    
+    #Almacenar en la base de datos
+    wisensor_db["questions"].insert_one(
+        {
+            "pregunta": request.user_question,
+            "respuesta": final_text
+        }
+    )
+    
     return FinalResponse(
         answer=final_text,
         chart=final_chart_object,
         audio_base64=audio_base64,
         debug_context=collected_data
     )
+
+
+class AudioResponse(BaseModel):
+    text: str
+
+@router.post("/analyze-question-audio/")
+async def analyze_question_audio(
+    request: AudioResponse,
+    db: Session = Depends(get_db)
+    ):
+    final_text = request.text
+    if tts_client and final_text:
+        try:
+            audio_response = await tts_client.audio.speech.create(
+                input=final_text,
+                model=settings.azure_openai_tts_deployment,
+                voice="nova",
+                response_format="mp3"
+            )
+            audio_base64 = base64.b64encode(audio_response.content).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Error al generar audio: {e}")
+            
+    return audio_base64
