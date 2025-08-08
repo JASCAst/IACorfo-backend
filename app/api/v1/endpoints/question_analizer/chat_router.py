@@ -3,6 +3,7 @@ import re
 import base64
 import logging
 import os
+import difflib
 from pymongo import MongoClient
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -39,6 +40,11 @@ from datetime import datetime
 # chat_router.py
 
 def merge_timeseries_data_for_chart(collected_data: dict, plan: dict) -> dict:
+    """
+    Combina múltiples resultados de series de tiempo en un solo objeto de gráfico,
+    creando una serie distinta para cada combinación de métrica y centro de origen.
+    """
+    # 1. Identificar todos los resultados que son de series de tiempo
     timeseries_keys = [
         step["store_result_as"] for step in plan.get("plan", []) 
         if step.get("tool") == "get_timeseries_data"
@@ -47,69 +53,96 @@ def merge_timeseries_data_for_chart(collected_data: dict, plan: dict) -> dict:
     if not timeseries_keys:
         return collected_data
 
+    # 2. Recolectar todos los puntos de datos, pero conservando su origen
     all_points = []
-    # --- LÓGICA MEJORADA PARA MÚLTIPLES MÉTRICAS ---
-    # 1. Recolectar todos los puntos de datos, reconociendo múltiples métricas por registro
-    for key in timeseries_keys:
+    center_names_map = {} # Para guardar los nombres bonitos de los centros
+
+    for key in timeseries_keys: # ej: "temperatura_pirquen"
         result = collected_data.get(key, {})
+        if not result or not result.get("data"):
+            continue
+
+        # --- LÓGICA CLAVE: ENCONTRAR EL NOMBRE DEL CENTRO ---
+        # Extraemos el nombre del centro de la clave, ej: "pirquen" de "temperatura_pirquen"
+        # Esto es una suposición, pero funciona para planes bien nombrados.
+        try:
+            center_alias = key.split('_')[-1]
+            # Buscamos en el contexto el resultado de 'get_center_id_by_name' que corresponde a ese alias
+            center_info_key = f"{center_alias}_id" # ej: "pirquen_id"
+            if center_info_key in collected_data:
+                center_names_map[key] = collected_data[center_info_key].get("center_name", center_alias.title())
+            else:
+                center_names_map[key] = center_alias.title()
+        except:
+            center_names_map[key] = key # Fallback
+
+        # --- FIN LÓGICA CLAVE ---
+
         for item in result.get("data", []):
             fecha = item.get("fecha")
             if not fecha: continue
             
-            # Itera sobre todas las posibles métricas en el registro
             for metric_key, value in item.items():
                 if metric_key != 'fecha':
                     all_points.append({
                         "fecha": fecha,
-                        "metric_name": metric_key,
+                        "origin_key": key,        # ej: "temperatura_pirquen"
+                        "metric_name": metric_key, # ej: "temperatura"
                         "value": value
                     })
 
     if not all_points:
         return collected_data
 
-    # 2. Ordenar todos los puntos cronológicamente
-    all_points.sort(key=lambda x: x["fecha"])
-
-    # 3. Construir la estructura final del gráfico
+    # 3. Construir la estructura del gráfico
     unique_timestamps = sorted(list(set(p["fecha"] for p in all_points)))
     xAxis = [ts.strftime('%Y-%m-%d %H:%M:%S') for ts in unique_timestamps]
     
-    unique_metrics = sorted(list(set(p["metric_name"] for p in all_points)))
+    # Identificamos las series únicas (ej: ('temperatura_pirquen', 'temperatura'))
+    unique_series_defs = sorted(list(set((p["origin_key"], p["metric_name"]) for p in all_points)))
     
-    series = []
-    for metric in unique_metrics:
-        serie_data = []
-        # Crea un mapa de (timestamp -> valor) para esta métrica específica
-        points_for_this_metric = {p["fecha"]: p["value"] for p in all_points if p["metric_name"] == metric}
+    series_data = []
+    chart_metric_names = []
+    chart_center_names = set()
+
+    for origin_key, metric_name in unique_series_defs:
+        # Crear un nombre descriptivo para la leyenda del gráfico
+        center_display_name = center_names_map.get(origin_key, origin_key)
+        metric_display_name = metric_name.replace("_", " ").title()
         
+        series_name = f"{metric_display_name} ({center_display_name})" # ej: "Temperatura (Centro Pirquen)"
+        
+        # Guardar nombres para el título del gráfico
+        if metric_display_name not in chart_metric_names:
+            chart_metric_names.append(metric_display_name)
+        chart_center_names.add(center_display_name)
+
+        # Filtrar los puntos que pertenecen solo a esta serie
+        points_for_this_series = {
+            p["fecha"]: p["value"] for p in all_points 
+            if p["origin_key"] == origin_key and p["metric_name"] == metric_name
+        }
+        
+        current_serie_points = []
         for ts in unique_timestamps:
-            serie_data.append(points_for_this_metric.get(ts, None)) # Añade el valor o null
+            current_serie_points.append(points_for_this_series.get(ts, None)) 
         
-        series.append({"name": metric.replace("_", " ").title(), "data": serie_data})
+        series_data.append({"name": series_name, "data": current_serie_points})
 
-    # --- FIN DE LA LÓGICA MEJORADA ---
-
-    if not series:
+    if not series_data:
         return collected_data
 
-    # Generamos un título dinámico
-    center_name = "Centro"
-    for key, value in collected_data.items():
-        if isinstance(value, dict) and "center_name" in value:
-            center_name = value["center_name"]
-            break
-            
-    chart_title = f'Gráfico de {", ".join(unique_metrics).replace("_", " ").title()} para {center_name}'
+    # 4. Generar un título dinámico y el objeto final del gráfico
+    title = f'Comparativa de {", ".join(chart_metric_names)} en {", ".join(sorted(list(chart_center_names)))}'
 
     collected_data["merged_chart_data"] = {
         "type": "line",
-        "title": chart_title,
+        "title": title,
         "xAxis": xAxis,
-        "series": series
+        "series": series_data
     }
 
-    logger.info("Datos de series de tiempo procesados. Eliminando fuentes originales del contexto.")
+    # 5. Limpiar el contexto para no pasarlo al sintetizador
     for key in timeseries_keys:
         if key in collected_data:
             del collected_data[key]
@@ -131,7 +164,15 @@ def limitar_contexto(contexto_previo: list, max_length: int = 6) -> list:
         contexto_previo.pop(0)
     return contexto_previo
 
-@router.post("/analyze-question/", response_model=FinalResponse)
+def contiene_palabra_similar(texto, palabras_clave, umbral=0.8):
+    palabras = texto.lower().split()
+    for palabra in palabras:
+        coincidencias = difflib.get_close_matches(palabra, palabras_clave, cutoff=umbral)
+        if coincidencias:
+            return True
+    return False
+
+@router.post("/analyze-question/")
 async def analyze_question_endpoint(
     request: QuestionRequest, 
     db: Session = Depends(get_db)):
@@ -187,6 +228,8 @@ async def analyze_question_endpoint(
                         if previous_result_key in collected_data and value_key in collected_data[previous_result_key]:
                             actual_value = collected_data[previous_result_key][value_key]
                             parameters[param_key] = actual_value # Reemplaza el placeholder con el valor real (ej: 6)
+                            #Agregar estado a la respuesta
+            
                             logger.info(f"Placeholder '{param_value}' reemplazado con el valor: {actual_value}")
                         else:
                             raise ValueError(f"No se pudo resolver el placeholder: {param_value}. El resultado del paso anterior no está disponible.")
@@ -213,7 +256,10 @@ async def analyze_question_endpoint(
             collected_data[result_key] = {"error": f"Ocurrió un error inesperado al ejecutar '{tool_name}'."}
     
     final_chart_object = None
-    user_wants_chart = any(keyword in request.user_question.lower() for keyword in ["grafico", "graficar", "dibuja", "muestra un", "visualiza un"])
+    user_wants_chart = contiene_palabra_similar(
+                        request.user_question,
+                        ["grafico", "graficar", "dibuja", "muestra", "visualiza"]
+                    )
     # Solo intentamos procesar y crear un gráfico si el usuario lo pidió
     if user_wants_chart:
         logger.info("El usuario solicitó un gráfico. Iniciando procesamiento de datos para gráfico.")
@@ -262,7 +308,7 @@ async def analyze_question_endpoint(
             audio_base64 = base64.b64encode(audio_response.content).decode("utf-8")
         except Exception as e:
             logger.error(f"Error al generar audio: {e}")
-    logger.info(f"respuesta: {final_text}, chart: {final_chart_object}, audio_base64: {audio_base64}, contexto={collected_data}")
+    logger.info(f"respuesta: {final_text}, chart: {final_chart_object}")
     
     #Almacenar en la base de datos
     wisensor_db["questions"].insert_one(
@@ -272,6 +318,51 @@ async def analyze_question_endpoint(
         }
     )
     
+    #si collect_data contiene pirquen_id, entonces se ha pedido el informe de pirquen
+    if "polocuhe_id" in collected_data and "pirquen_id" in collected_data:
+        collected_data["coordendadas"] =  {
+                                            "id": "5",
+                                            "name": "Polocuhe y Pirquen",
+                                            "coordinates": [
+                                                [-42.1163425, -73.4443599],
+                                                [-42.1320328, -73.4319801],
+                                                [-42.1217836, -73.4099809],
+                                                [-42.1083699, -73.4234658],
+                                            ],
+                                            "color": "blue",
+                                            "zoom": 8,
+                                            "clima" : "lluvia"
+                                        }
+    elif "polocuhe_id" in collected_data:
+        collected_data["coordendadas"] =  {
+                                            "id": "5",
+                                            "name": "Polocuhe",
+                                            "coordinates": [
+                                                [-42.3076836, -73.3845731],
+                                                [-42.5103388, -73.3871473],
+                                                [-42.5192116, -73.0835920],
+                                                [-42.3167438, -73.0761471],
+                                            ],
+                                            "color": "blue",
+                                            "zoom": 11,
+                                            "clima": "soleado"
+                                        }
+    elif "pirquen_id" in collected_data:
+        collected_data["coordendadas"] =  {
+                                            "id": "4",
+                                            "name": "Pirquen",
+                                            "coordinates": [
+                                                [-42.1163425, -73.4443599],
+                                                [-42.1320328, -73.4319801],
+                                                [-42.1217836, -73.4099809],
+                                                [-42.1083699, -73.4234658],
+                                            ],
+                                            "color": "green",
+                                            "zoom": 13
+                                        }
+    else:
+        collected_data["coordendadas"] = None
+        
     return FinalResponse(
         answer=final_text,
         chart=final_chart_object,
