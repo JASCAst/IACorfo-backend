@@ -213,14 +213,20 @@ class ToolExecutor:
         # --- INICIO DE LA NUEVA LÓGICA DE LÍMITE INTELIGENTE ---
         apply_limit = limit  # Empezamos con el límite que el usuario podría haber especificado
 
+        limit_was_applied_by_default = False
+        
+        if apply_limit is None:
+            apply_limit = DEFAULT_TIMESERIES_LIMIT
         # Caso 1: Petición ambigua sin fechas ni límite explícito.
         if not start_date and not end_date and not limit:
-            apply_limit = 200
+            apply_limit = DEFAULT_TIMESERIES_LIMIT
+            limit_was_applied_by_default = True
             logger.info(f"Petición ambigua. Aplicando límite por defecto de los últimos {apply_limit} registros.")
 
         # Caso 2: Petición para un solo día, sin límite explícito.
         elif start_date and end_date and start_date == end_date and not limit:
-            apply_limit = 200  # Puedes ajustar este valor si lo necesitas
+            apply_limit = DEFAULT_TIMESERIES_LIMIT
+            limit_was_applied_by_default = True
             logger.info(f"Petición para un solo día. Aplicando límite por defecto de {apply_limit} registros.")
         
         # En cualquier otro caso (rango de fechas o límite explícito), apply_limit ya tiene el valor correcto (el del usuario o None).
@@ -252,7 +258,14 @@ class ToolExecutor:
         result = list(collection.aggregate(pipeline))
         logger.info(f"Resultado de la agregación: {len(result)} documentos.")
 
-        return {"count": len(result), "data": result} if result else {"count": 0, "summary": "No se encontraron datos."}    
+        return {
+            "count": len(result),
+            "limit_applied": limit_was_applied_by_default, 
+            "data": result
+            } if result else {
+                "count": 0, 
+                "summary": "No se encontraron datos."
+                }    
 
     def get_center_id_by_name(self, center_name: str) -> dict:
         """Busca el ID de un centro por su nombre canónico."""
