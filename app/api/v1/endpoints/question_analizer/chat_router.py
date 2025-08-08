@@ -297,18 +297,18 @@ async def analyze_question_endpoint(
     final_text = raw_synthesis
     # Generación de audio
     audio_base64 = None
-    if tts_client and final_text:
-        try:
-            audio_response = await tts_client.audio.speech.create(
-                input=final_text,
-                model=settings.azure_openai_tts_deployment,
-                voice="nova",
-                response_format="mp3"
-            )
-            audio_base64 = base64.b64encode(audio_response.content).decode("utf-8")
-        except Exception as e:
-            logger.error(f"Error al generar audio: {e}")
-    logger.info(f"respuesta: {final_text}, chart: {final_chart_object}")
+    # if tts_client and final_text:
+    #     try:
+    #         audio_response = await tts_client.audio.speech.create(
+    #             input=final_text,
+    #             model=settings.azure_openai_tts_deployment,
+    #             voice="nova",
+    #             response_format="mp3"
+    #         )
+    #         audio_base64 = base64.b64encode(audio_response.content).decode("utf-8")
+    #     except Exception as e:
+    #         logger.error(f"Error al generar audio: {e}")
+    # logger.info(f"respuesta: {final_text}, chart: {final_chart_object}")
     
     #Almacenar en la base de datos
     wisensor_db["questions"].insert_one(
@@ -365,8 +365,8 @@ async def analyze_question_endpoint(
         
     return FinalResponse(
         answer=final_text,
-        chart=final_chart_object,
-        audio_base64=audio_base64,
+        chart=final_chart_object, 
+        # audio_base64=final_text,
         debug_context=collected_data
     )
 
@@ -392,4 +392,6 @@ async def analyze_question_audio(
         except Exception as e:
             logger.error(f"Error al generar audio: {e}")
             
-    return audio_base64
+    return {
+            "audio_base64": audio_base64
+            }
