@@ -124,5 +124,8 @@ class MasterCenter(Base):
     id = Column(Integer, primary_key=True, index=True)
     canonical_name = Column(String, unique=True, index=True, nullable=False)
     canonical_code = Column(String, unique=True)
+    estado = Column(String, nullable=False)
+    latitud = Column(Float, nullable=False)
+    longitud = Column(Float, nullable=False)
     aliases = Column(JSONB)   
   

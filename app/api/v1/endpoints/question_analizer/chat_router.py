@@ -331,7 +331,7 @@ async def analyze_question_endpoint(
                                             ],
                                             "color": "blue",
                                             "zoom": 8,
-                                            "clima" : "lluvia"
+                                            "clima" : "lluvioso"
                                         }
     elif "polocuhe_id" in collected_data:
         collected_data["coordendadas"] =  {
@@ -358,7 +358,8 @@ async def analyze_question_endpoint(
                                                 [-42.1083699, -73.4234658],
                                             ],
                                             "color": "green",
-                                            "zoom": 13
+                                            "zoom": 13,
+                                            "clima": "soleado"
                                         }
     else:
         collected_data["coordendadas"] = None
@@ -395,3 +396,48 @@ async def analyze_question_audio(
     return {
             "audio_base64": audio_base64
             }
+
+
+@router.get("/datos-centros")
+async def get_centers_data(
+    db: Session = Depends(get_db)
+):
+    centros = ToolExecutor._get_all_centers(db)
+    # recorrer y construir el objeto
+    centers = []
+    for center in centros:
+        if center.canonical_code == "102":
+            centers.append({
+                            "id": center.id,
+                            "name": "Polocuhe",
+                            "coordinates": [
+                                [-42.3076836, -73.3845731],
+                                [-42.5103388, -73.3871473],
+                                [-42.5192116, -73.0835920],
+                                [-42.3167438, -73.0761471],
+                            ],
+                            "color": "blue",
+                            "clima": "lluvioso"
+                        })
+        elif center.canonical_code == "10934444":
+            centers.append({
+                            "id": center.id,
+                            "name": "Pirquen",
+                            "coordinates": [
+                                [-42.1163425, -73.4443599],
+                                [-42.1320328, -73.4319801],
+                                [-42.1217836, -73.4099809],
+                                [-42.1083699, -73.4234658],
+                            ],
+                            "color": "green",
+                            "clima": "soleado"
+                        })
+        else: 
+            centers.append({
+                "id": center.id,
+                "name": center.canonical_name,
+                "coordinates": [[center.latitud, center.longitud]],
+                "color": "gray",
+                "clima" : "lluvioso"
+            })
+    return centers
