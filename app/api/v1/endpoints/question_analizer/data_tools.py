@@ -22,6 +22,10 @@ class ToolExecutor:
     def _get_master_center_aliases(self, center_id: int):
         center = self.db.query(MasterCenter).filter(MasterCenter.id == center_id).first()
         return center.aliases if center else None
+    
+    def _get_all_centers(db: Session):
+        centers = db.query(MasterCenter).all()
+        return centers
 
     # --- FUNCIÓN REESCRITA PARA SER MÁS INTELIGENTE ---
     # data_tools.py
@@ -119,72 +123,6 @@ class ToolExecutor:
             logger.error(f"Error al obtener todos los centros: {e}")
             return {"error": "Ocurrió un error al consultar la base de datos de centros."}
 
-    """  def get_timeseries_data(self, center_id: int, source: str, metrics: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> dict:
-        # Mapeo de métricas amigables a campos de la base de datos
-        METRIC_MAP = {
-            "clima": {
-                "temperatura": "$datos.temperature", # temperatura ambiental
-                "viento": "$datos.speed", #velocidad viento
-                "presionat": "$datos.pressure" # presion atmosferica
-            },
-            "alimentacion": {
-                "cantidad_gramos": "$AmountGrams",
-                "peso_promedio": "$PesoProm",
-                "cantidad_peces": "$FishCount",
-            }
-        }
-
-        aliases = self._get_master_center_aliases(center_id)
-        if not aliases: return {"error": f"Centro con ID maestro {center_id} no encontrado."}
-        
-        match_filter = {}
-        collection = None
-        date_field = None
-
-        if source == "alimentacion":
-            collection = self.alimentacion_coll
-            date_field = "FechaHora"
-            if "Name" in aliases: match_filter["Name"] = aliases["Name"]
-        elif source == "clima":
-            collection = self.clima_coll
-            date_field = "fecha"
-            if "clima_db_code" in aliases: match_filter["codigo_centro"] = aliases["clima_db_code"]
-        else:
-            return {"error": f"Fuente de datos '{source}' no reconocida."}
-
-        apply_limit = limit
-        if not start_date and not end_date and not limit:
-            apply_limit = 200
-            logger.info(f"Petición ambigua. Aplicando límite por defecto de los últimos {apply_limit} registros.")
-
-        if start_date and end_date:
-            match_filter[date_field] = {"$gte": date_parser.parse(start_date), "$lte": date_parser.parse(end_date).replace(hour=23, minute=59, second=59)}
-
-        logger.info(f"Ejecutando query en '{source}' con filtro: {match_filter}")
-        pipeline = [{"$match": match_filter}]
-
-        if apply_limit:
-            pipeline.append({"$sort": {date_field: -1}})
-            pipeline.append({"$limit": apply_limit})
-
-        # --- LÓGICA DE PROYECCIÓN DINÁMICA ---
-        projection = {"_id": 0, "fecha": f"${date_field}"}
-        for metric in metrics:
-            if metric in METRIC_MAP.get(source, {}):
-                projection[metric] = METRIC_MAP[source][metric]
-            else:
-                logger.warning(f"Métrica '{metric}' no reconocida para la fuente '{source}'.")
-        
-        if len(projection) > 2: # Si se añadió al menos una métrica válida
-            pipeline.append({"$project": projection})
-        else:
-            return {"error": f"Ninguna de las métricas solicitadas {metrics} es válida para la fuente {source}."}
-
-        result = list(collection.aggregate(pipeline))
-        logger.info(f"Resultado de la agregación: {len(result)} documentos.")
-
-        return {"count": len(result), "data": result} if result else {"count": 0, "summary": "No se encontraron datos."} """
-    # data_tools.py
 
     def get_timeseries_data(self, center_id: int, source: str, metrics: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> dict:
         # --- Mapeo de métricas y alias (sin cambios) ---
