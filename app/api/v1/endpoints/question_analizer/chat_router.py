@@ -1,28 +1,33 @@
+# app/chat/chat_router.py
+
 import json
 import re
 import base64
 import logging
-import os
-import difflib
 from pymongo import MongoClient
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from openai import AsyncAzureOpenAI
-from datetime import datetime, timedelta
 from app.core.database import get_db
 from app.core.config import settings
 from .models import QuestionRequest, FinalResponse, ChartData
 from .llm_orchestrator import create_execution_plan, synthesize_response
 from .data_tools import ToolExecutor
+from typing import List, Dict, Any
+from datetime import datetime
 from pydantic import BaseModel
-
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# coleccion de pregruntas
-mongo_db = MongoClient(os.getenv("MONGO_URI"))
-wisensor_db = mongo_db["wisensor_db"]
+# Conexión a MongoDB para el historial de preguntas
+try:
+    mongo_db_client = MongoClient(settings.mongo_uri)
+    wisensor_db = mongo_db_client[settings.mongo_db_name]
+    questions_collection = wisensor_db["questions_history"]
+except Exception as e:
+    logger.error(f"No se pudo conectar a MongoDB para el historial: {e}")
+    questions_collection = None
 
 # Cliente para Text-to-Speech (TTS)
 try:
@@ -34,121 +39,18 @@ try:
 except Exception as e:
     tts_client = None
     logger.error(f"No se pudo inicializar el cliente TTS de Azure: {e}")
-# chat_router.py
-from datetime import datetime
 
-# chat_router.py
-
-def merge_timeseries_data_for_chart(collected_data: dict, plan: dict) -> dict:
-    """
-    Combina múltiples resultados de series de tiempo en un solo objeto de gráfico,
-    creando una serie distinta para cada combinación de métrica y centro de origen.
-    """
-    # 1. Identificar todos los resultados que son de series de tiempo
-    timeseries_keys = [
-        step["store_result_as"] for step in plan.get("plan", []) 
-        if step.get("tool") == "get_timeseries_data"
-    ]
-
-    if not timeseries_keys:
-        return collected_data
-
-    # 2. Recolectar todos los puntos de datos, pero conservando su origen
-    all_points = []
-    center_names_map = {} # Para guardar los nombres bonitos de los centros
-
-    for key in timeseries_keys: # ej: "temperatura_pirquen"
-        result = collected_data.get(key, {})
-        if not result or not result.get("data"):
-            continue
-
-        # --- LÓGICA CLAVE: ENCONTRAR EL NOMBRE DEL CENTRO ---
-        # Extraemos el nombre del centro de la clave, ej: "pirquen" de "temperatura_pirquen"
-        # Esto es una suposición, pero funciona para planes bien nombrados.
-        try:
-            center_alias = key.split('_')[-1]
-            # Buscamos en el contexto el resultado de 'get_center_id_by_name' que corresponde a ese alias
-            center_info_key = f"{center_alias}_id" # ej: "pirquen_id"
-            if center_info_key in collected_data:
-                center_names_map[key] = collected_data[center_info_key].get("center_name", center_alias.title())
-            else:
-                center_names_map[key] = center_alias.title()
-        except:
-            center_names_map[key] = key # Fallback
-
-        # --- FIN LÓGICA CLAVE ---
-
-        for item in result.get("data", []):
-            fecha = item.get("fecha")
-            if not fecha: continue
-            
-            for metric_key, value in item.items():
-                if metric_key != 'fecha':
-                    all_points.append({
-                        "fecha": fecha,
-                        "origin_key": key,        # ej: "temperatura_pirquen"
-                        "metric_name": metric_key, # ej: "temperatura"
-                        "value": value
-                    })
-
-    if not all_points:
-        return collected_data
-
-    # 3. Construir la estructura del gráfico
-    unique_timestamps = sorted(list(set(p["fecha"] for p in all_points)))
-    xAxis = [ts.strftime('%Y-%m-%d %H:%M:%S') for ts in unique_timestamps]
-    
-    # Identificamos las series únicas (ej: ('temperatura_pirquen', 'temperatura'))
-    unique_series_defs = sorted(list(set((p["origin_key"], p["metric_name"]) for p in all_points)))
-    
-    series_data = []
-    chart_metric_names = []
-    chart_center_names = set()
-
-    for origin_key, metric_name in unique_series_defs:
-        # Crear un nombre descriptivo para la leyenda del gráfico
-        center_display_name = center_names_map.get(origin_key, origin_key)
-        metric_display_name = metric_name.replace("_", " ").title()
-        
-        series_name = f"{metric_display_name} ({center_display_name})" # ej: "Temperatura (Centro Pirquen)"
-        
-        # Guardar nombres para el título del gráfico
-        if metric_display_name not in chart_metric_names:
-            chart_metric_names.append(metric_display_name)
-        chart_center_names.add(center_display_name)
-
-        # Filtrar los puntos que pertenecen solo a esta serie
-        points_for_this_series = {
-            p["fecha"]: p["value"] for p in all_points 
-            if p["origin_key"] == origin_key and p["metric_name"] == metric_name
-        }
-        
-        current_serie_points = []
-        for ts in unique_timestamps:
-            current_serie_points.append(points_for_this_series.get(ts, None)) 
-        
-        series_data.append({"name": series_name, "data": current_serie_points})
-
-    if not series_data:
-        return collected_data
-
-    # 4. Generar un título dinámico y el objeto final del gráfico
-    title = f'Comparativa de {", ".join(chart_metric_names)} en {", ".join(sorted(list(chart_center_names)))}'
-
-    collected_data["merged_chart_data"] = {
-        "type": "line",
-        "title": title,
-        "xAxis": xAxis,
-        "series": series_data
-    }
-
-    # 5. Limpiar el contexto para no pasarlo al sintetizador
-    for key in timeseries_keys:
-        if key in collected_data:
-            del collected_data[key]
-            
-    return collected_data
-
+def clean_context(context: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Elimina datos pesados como audio del contexto para no sobrecargar los prompts."""
+    if not context:
+        return []
+    clean = []
+    for message in context:
+        msg_copy = message.copy()
+        msg_copy.pop("audioBase64", None)
+        msg_copy.pop("debug_context", None)
+        clean.append(msg_copy)
+    return clean
 def limpiar_contexto(data: dict) -> dict:
     contexto = data.get("contexto_previo", [])
     for mensaje in contexto:
@@ -164,162 +66,175 @@ def limitar_contexto(contexto_previo: list, max_length: int = 6) -> list:
         contexto_previo.pop(0)
     return contexto_previo
 
-def contiene_palabra_similar(texto, palabras_clave, umbral=0.8):
-    palabras = texto.lower().split()
-    for palabra in palabras:
-        coincidencias = difflib.get_close_matches(palabra, palabras_clave, cutoff=umbral)
-        if coincidencias:
-            return True
-    return False
+def clima_simple(
+    json_data, 
+    umbral_lluvia=1.0, 
+    umbral_llovizna=1.0,
+    usar_viento=True, 
+    viento_fuerte=20.0, 
+    temp_fresca=12.0
+    ):
+    
+    segunda_clave = list(json_data.keys())[1]
+    registro = json_data[segunda_clave]["data"][0]
+    
+    if not registro:
+        return None
 
-@router.post("/analyze-question/")
-async def analyze_question_endpoint(
-    request: QuestionRequest, 
-    db: Session = Depends(get_db)):
+    precip = float(registro.get("precipitacion", 0) or 0)
+    temp = float(registro.get("temperatura", registro.get("temperatura_maxima", 0)) or 0)
+    viento = float(registro.get("viento", 0) or 0)
+
+    if precip >= umbral_lluvia:
+        return "lluvioso"
+    elif 0 < precip < umbral_llovizna:
+        return "nublado"
+
+    estado = "soleado"
+
+    if usar_viento and viento >= viento_fuerte and temp <= temp_fresca:
+        estado = "nublado"
+
+    return estado
+
+@router.post("/analyze-question/", response_model=FinalResponse)
+async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depends(get_db)):
     
     data_dict = request.dict()
     data_limpio = limpiar_contexto(data_dict)
-    
     if "contexto_previo" in data_limpio:
         data_limpio["contexto_previo"] = limitar_contexto(data_limpio["contexto_previo"], 6)
-        
-    # ETAPA 1: PLANIFICACIÓN
+
     logger.info(f"Creando plan para la pregunta: '{request.user_question}'")
-    plan = await create_execution_plan(request.user_question, request.center_id, data_limpio['contexto_previo'])
+    plan = await create_execution_plan(request.user_question, request.center_id, data_limpio["contexto_previo"])
     
-    if not plan or "error" in plan:
-        raise HTTPException(status_code=500, detail=f"No se pudo crear un plan de ejecución válido: {plan.get('details', 'Error desconocido')}")
+    if not plan or "plan" not in plan:
+        error_detail = plan.get('details', 'Error desconocido al generar el plan.')
+        raise HTTPException(status_code=500, detail=f"No se pudo crear un plan de ejecución: {error_detail}")
 
-    if plan.get("plan") and plan["plan"][0].get("tool") == "direct_answer":
-        direct_response_text = plan["plan"][0].get("response", "No pude procesar tu saludo, intenta de nuevo.")
-        logger.info(f"Respuesta directa generada: {direct_response_text}")
-        return FinalResponse(answer=direct_response_text)
-
-    if plan.get("plan") is None:
-         raise HTTPException(status_code=500, detail="La IA no generó un plan de acción para esta pregunta.")
-
-    # ETAPA 2: EJECUCIÓN CON LÓGICA DE FALLBACK
-    logger.info(f"Ejecutando plan: {plan}")
-    executor = ToolExecutor(db_session=db)
     collected_data = {}
+    executor = ToolExecutor(db_session=db)
 
-    for step in plan["plan"]:
+    # ETAPA 2: EJECUCIÓN
+    logger.info(f"Ejecutando plan: {json.dumps(plan, indent=2)}")
+    for step in plan.get("plan", []):
         tool_name = step.get("tool")
-        parameters = step.get("parameters", {}).copy() 
+        parameters = step.get("parameters", {}).copy()
         result_key = step.get("store_result_as")
-        
+
+        if not all([tool_name, result_key]):
+            logger.warning(f"Paso de plan inválido, omitiendo: {step}")
+            continue
+
         try:
-            # --- INICIO DE LA LÓGICA DE REEMPLAZO DE PLACEHOLDERS ---
-            for param_key, param_value in parameters.items():
-                if isinstance(param_value, str):
-                    # Expresión regular para encontrar placeholders como {{...}} o ${...}
-                    match = re.match(r'^\$\{(.*)\}$|^\{\{(.*)\}\}$', param_value)
-                    if match:
-                        # Extrae el contenido del placeholder (ej: "polocuhe_id.center_id")
-                        placeholder_content = next((g for g in match.groups() if g is not None), None)
-                        if not placeholder_content:
-                            raise ValueError(f"No se pudo extraer contenido del placeholder: {param_value}")
-
-                        parts = placeholder_content.split('.')
-                        previous_result_key = parts[0] # "polocuhe_id"
-                        value_key = parts[1]           # "center_id"
-
-                        # Busca el valor en los datos ya recolectados
-                        if previous_result_key in collected_data and value_key in collected_data[previous_result_key]:
-                            actual_value = collected_data[previous_result_key][value_key]
-                            parameters[param_key] = actual_value # Reemplaza el placeholder con el valor real (ej: 6)
-                            #Agregar estado a la respuesta
             
-                            logger.info(f"Placeholder '{param_value}' reemplazado con el valor: {actual_value}")
+            for param_key, param_value in parameters.items():
+                
+                # Caso 1: El valor es un string simple
+                if isinstance(param_value, str):
+                    match = re.match(r'^\$\{(.*)\.(.*)\}$', param_value)
+                    if match:
+                        prev_step_key, value_key = match.groups()
+                        if prev_step_key in collected_data and value_key in collected_data[prev_step_key]:
+                            parameters[param_key] = collected_data[prev_step_key][value_key]
                         else:
-                            raise ValueError(f"No se pudo resolver el placeholder: {param_value}. El resultado del paso anterior no está disponible.")
-            # --- FIN DE LA LÓGICA DE REEMPLAZO ---
+                            raise ValueError(f"No se pudo resolver el placeholder: {param_value}")
+                
+                # Caso 2: El valor es una lista que puede contener placeholders
+                elif isinstance(param_value, list):
+                    processed_list = []
+                    for item in param_value:
+                        if isinstance(item, str):
+                            match = re.match(r'^\$\{(.*)\.(.*)\}$', item)
+                            if match:
+                                prev_step_key, value_key = match.groups()
+                                if prev_step_key in collected_data and value_key in collected_data[prev_step_key]:
+                                    processed_list.append(collected_data[prev_step_key][value_key])
+                                else:
+                                    raise ValueError(f"No se pudo resolver el placeholder en la lista: {item}")
+                            else:
+                                processed_list.append(item) 
+                        else:
+                            processed_list.append(item) 
+                    parameters[param_key] = processed_list
 
+            # Ejecución de la herramienta
             if hasattr(executor, tool_name):
                 tool_method = getattr(executor, tool_name)
                 result = tool_method(**parameters)
                 collected_data[result_key] = result
 
-                # Tu lógica de fallback (sin cambios)
-                if tool_name == "get_timeseries_data" and result.get("count") == 0:
-                    logger.info(f"No se encontraron datos para '{result_key}'. Buscando rango disponible...")
-                    range_info = executor.get_data_range_summary(
-                        source=parameters.get('source'), 
-                        center_id=parameters.get('center_id')
-                    )
-                    collected_data[f"{result_key}_range_info"] = range_info
+                is_data_tool = tool_name in ["get_timeseries_data", "correlate_timeseries_data", "get_monthly_aggregation"]
+                if is_data_tool and result.get("count") == 0 and "center_id" in parameters:
+                    logger.info(f"'{tool_name}' no encontró datos. Buscando rango de fechas disponible...")
+                    source = parameters.get('source') or parameters.get('primary_source', 'clima')
+                    if source:
+                        range_info = executor.get_data_range_for_source(center_id=parameters['center_id'], source=source)
+                        collected_data[f"{result_key}_available_range"] = range_info
+
+            elif tool_name == "direct_answer":
+                collected_data[result_key] = {"answer": parameters.get("response", "No pude procesar tu solicitud.")}
             else:
-                collected_data[result_key] = {"error": f"Herramienta '{tool_name}' no encontrada."}
-                
+                raise AttributeError(f"Herramienta '{tool_name}' no encontrada.")
+
         except Exception as e:
-            logger.error(f"Error en el paso '{tool_name}': {e}")
-            collected_data[result_key] = {"error": f"Ocurrió un error inesperado al ejecutar '{tool_name}'."}
-    
-    final_chart_object = None
-    user_wants_chart = contiene_palabra_similar(
-                        request.user_question,
-                        ["grafico", "graficar", "dibuja", "muestra", "visualiza"]
-                    )
-    # Solo intentamos procesar y crear un gráfico si el usuario lo pidió
-    if user_wants_chart:
-        logger.info("El usuario solicitó un gráfico. Iniciando procesamiento de datos para gráfico.")
-        
-        # Procesamiento de datos de series de tiempo
-        collected_data = merge_timeseries_data_for_chart(collected_data, plan)
-        if "merged_chart_data" in collected_data:
-            logger.info("Creando objeto ChartData desde datos de series de tiempo pre-procesados.")
-            final_chart_object = ChartData(**collected_data["merged_chart_data"]) 
-        
-    # ETAPA 3: SÍNTESIS (La IA genera texto y, a veces, un gráfico de informe)
-    logger.info(f"Sintetizando respuesta con datos: {collected_data}")
+            logger.error(f"Error en el paso '{tool_name}': {e}", exc_info=True)
+            collected_data[result_key] = {"error": f"Falló la ejecución de la herramienta '{tool_name}'."}
+
+    logger.info(f"Sintetizando respuesta con datos: {json.dumps(collected_data, indent=2, default=str)}")
     raw_synthesis = await synthesize_response(request.user_question, collected_data)
 
-    # Intento 2: Si no teníamos un gráfico de series de tiempo, buscar uno de informe
-    if user_wants_chart and final_chart_object is None and isinstance(raw_synthesis, str):
-        if final_chart_object is None and isinstance(raw_synthesis, str):
-            chart_match = re.search(r'```json\s*({[\s\S]*?})\s*```', raw_synthesis, re.DOTALL)
-            if chart_match:
-                try:
-                    logger.info("Se encontró un JSON de gráfico en la respuesta de la IA. Procesando...")
-                    chart_json_str = chart_match.group(1)
-                    chart_obj = json.loads(chart_json_str)
-                    
-                    if 'chart' in chart_obj:
-                        # Asignamos el resultado a la misma variable final
-                        final_chart_object = ChartData(**chart_obj['chart'])
-                        # Limpiamos el texto
-                        raw_synthesis = re.sub(r'```json[\s\S]*?```', '', raw_synthesis).strip()
-                
-                except Exception as e:
-                    logger.error(f"Error al parsear el JSON del gráfico del informe: {e}")
-                    final_chart_object = None
-
     final_text = raw_synthesis
-    # Generación de audio
-    audio_base64 = None
-    # if tts_client and final_text:
-    #     try:
-    #         audio_response = await tts_client.audio.speech.create(
-    #             input=final_text,
-    #             model=settings.azure_openai_tts_deployment,
-    #             voice="nova",
-    #             response_format="mp3"
-    #         )
-    #         audio_base64 = base64.b64encode(audio_response.content).decode("utf-8")
-    #     except Exception as e:
-    #         logger.error(f"Error al generar audio: {e}")
-    # logger.info(f"respuesta: {final_text}, chart: {final_chart_object}")
+    final_chart_object = None
+
+    chart_match = re.search(r'```json\s*({[\s\S]*?})\s*```', raw_synthesis, re.DOTALL)
+    if chart_match:
+        try:
+            chart_json_str = chart_match.group(1)
+            chart_obj = json.loads(chart_json_str)
+            if 'chart' in chart_obj:
+                final_chart_object = ChartData(**chart_obj['chart'])
+                final_text = re.sub(r'```json[\s\S]*?```', '', final_text).strip()
+        except Exception as e:
+            logger.error(f"Error al procesar el JSON del gráfico de la IA: {e}")
+            final_chart_object = None
+            
+    if questions_collection is not None:
+        questions_collection.insert_one({
+            "question": request.user_question,
+            "answer": final_text,
+            "timestamp": datetime.now()
+        })
     
-    #Almacenar en la base de datos
-    wisensor_db["questions"].insert_one(
-        {
-            "pregunta": request.user_question,
-            "respuesta": final_text
-        }
-    )
-    
-    #si collect_data contiene pirquen_id, entonces se ha pedido el informe de pirquen
-    if "polocuhe_id" in collected_data and "pirquen_id" in collected_data:
+    def estructura_clima_1_centros(collected_data):
+        #restructurar json
+        primera_clave = list(collected_data.keys())[0]
+        segunda_clave = list(collected_data.keys())[1]
+        collected_data["centros"] = [collected_data[primera_clave]]
+        collected_data["datos_centros"] = [collected_data[segunda_clave]]
+        
+        #eliminar datos de clima
+        del collected_data[primera_clave]
+        del collected_data[segunda_clave]
+        
+    def estructura_clima_2_centros(collected_data):
+        #restructurar json
+        primera_clave = list(collected_data.keys())[0]
+        segunda_clave = list(collected_data.keys())[1]
+        tercera_clave = list(collected_data.keys())[2]
+        cuarta_clave = list(collected_data.keys())[3]
+        
+        #agregar datos de clima
+        collected_data["centros"] = [collected_data[primera_clave],[collected_data[segunda_clave]]]
+        collected_data["datos_centro"] = [collected_data[tercera_clave],[collected_data[cuarta_clave]]]
+        
+        #eliminar datos de clima
+        del collected_data[primera_clave]
+        del collected_data[segunda_clave]
+        del collected_data[tercera_clave]
+        del collected_data[cuarta_clave]
+        
+    if "polocuhe_info" in collected_data and "pirquen_info" in collected_data:
         collected_data["coordendadas"] =  {
                                             "id": "5",
                                             "name": "Polocuhe y Pirquen",
@@ -331,9 +246,10 @@ async def analyze_question_endpoint(
                                             ],
                                             "color": "blue",
                                             "zoom": 8,
-                                            "clima" : "lluvioso"
+                                            "clima" : "soleado"
                                         }
-    elif "polocuhe_id" in collected_data:
+        estructura_clima_2_centros(collected_data)
+    elif "polocuhe_info" in collected_data:
         collected_data["coordendadas"] =  {
                                             "id": "5",
                                             "name": "Polocuhe",
@@ -345,9 +261,10 @@ async def analyze_question_endpoint(
                                             ],
                                             "color": "blue",
                                             "zoom": 11,
-                                            "clima": "soleado"
+                                            "clima": clima_simple(collected_data)
                                         }
-    elif "pirquen_id" in collected_data:
+        estructura_clima_1_centros(collected_data)
+    elif "pirquen_info" in collected_data:
         collected_data["coordendadas"] =  {
                                             "id": "4",
                                             "name": "Pirquen",
@@ -359,22 +276,21 @@ async def analyze_question_endpoint(
                                             ],
                                             "color": "green",
                                             "zoom": 13,
-                                            "clima": "soleado"
+                                            "clima": clima_simple(collected_data)
                                         }
+        estructura_clima_1_centros(collected_data)
     else:
         collected_data["coordendadas"] = None
         
     return FinalResponse(
         answer=final_text,
-        chart=final_chart_object, 
-        # audio_base64=final_text,
+        chart=final_chart_object,
         debug_context=collected_data
     )
 
-
 class AudioResponse(BaseModel):
     text: str
-
+    
 @router.post("/analyze-question-audio/")
 async def analyze_question_audio(
     request: AudioResponse,
@@ -396,8 +312,7 @@ async def analyze_question_audio(
     return {
             "audio_base64": audio_base64
             }
-
-
+    
 @router.get("/datos-centros")
 async def get_centers_data(
     db: Session = Depends(get_db)
@@ -441,3 +356,35 @@ async def get_centers_data(
                 "clima" : "lluvioso"
             })
     return centers
+
+
+from fastapi.responses import StreamingResponse
+import io
+
+@router.post("/analyze-question-audio-streaming/")
+async def analyze_question_audio_streaming(
+    request: AudioResponse,
+    db: Session = Depends(get_db)
+):
+    final_text = request.text
+    if not final_text:
+        return {"error": "Texto no proporcionado"}, 400
+
+    try:
+        audio_response = await tts_client.audio.speech.create(
+            input=final_text,
+            model=settings.azure_openai_tts_deployment,
+            voice="nova",
+            response_format="mp3"
+        )
+
+        # Generador síncrono
+        def audio_streamer():
+            for chunk in audio_response.iter_bytes(chunk_size=1024):
+                yield chunk
+
+        return StreamingResponse(audio_streamer(), media_type="audio/mpeg")
+
+    except Exception as e:
+        logger.error(f"Error al generar audio en streaming: {e}")
+        return {"error": "No se pudo generar el audio"}, 500
