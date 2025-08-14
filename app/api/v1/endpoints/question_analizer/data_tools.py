@@ -10,7 +10,7 @@ from app.models.models import MasterCenter, Center
 from typing import Optional, List, Dict, Any
 import re
 from datetime import datetime, timedelta
-
+from typing import Union
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -129,14 +129,31 @@ class ToolExecutor:
             logger.error(f"Error buscando centro por nombre: {e}")
             return {"error": "Error en la base de datos al buscar el centro."}
 
+    # En data_tools.py, dentro de la clase ToolExecutor
+
     def get_all_centers(self) -> dict:
-        """Obtiene una lista de todos los centros de cultivo disponibles."""
+        """
+        Obtiene una lista de todos los centros de cultivo disponibles,
+        incluyendo una lista simple de sus IDs para facilitar su uso en el planificador.
+        """
         logger.info("Obteniendo lista de todos los centros.")
         try:
             centers = self.db.query(MasterCenter).order_by(MasterCenter.canonical_name).all()
-            if not centers: return {"count": 0, "centers": []}
+            if not centers: 
+                return {"count": 0, "centers": [], "center_ids": []}
+            
             center_list = [{"id": center.id, "name": center.canonical_name} for center in centers]
-            return {"count": len(center_list), "centers": center_list}
+            
+            # --- INICIO DE LA MEJORA ---
+            # Creamos una lista simple que contiene solo los IDs
+            center_ids = [center.id for center in centers]
+            # --- FIN DE LA MEJORA ---
+
+            return {
+                "count": len(center_list),
+                "centers": center_list,
+                "center_ids": center_ids # <-- Añadimos la nueva clave al resultado
+            }
         except Exception as e:
             logger.error(f"Error al obtener todos los centros: {e}")
             return {"error": "No se pudo obtener la lista de centros."}
@@ -198,43 +215,54 @@ class ToolExecutor:
             logger.error(f"Error buscando rango de datos: {e}")
             return {"error": "No se pudo determinar el rango de fechas."}
 
-    def get_timeseries_data(self, center_id: int, source: str, metrics: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> dict:
+    def get_timeseries_data(self, center_ids: Union[int, List[int]], source: str, metrics: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> dict:
         """
-        Obtiene una serie de tiempo para una o más métricas de una SOLA fuente.
-        Aplica un límite por defecto si no se especifica un rango de fechas o un límite explícito.
+        Obtiene una serie de tiempo para una o más métricas.
+        Ahora acepta un solo ID de centro o una lista de IDs.
         """
-        logger.info(f"Ejecutando get_timeseries_data para centro ID {center_id}, fuente '{source}'")
+        logger.info(f"Ejecutando get_timeseries_data para centro(s) ID(s) {center_ids}, fuente '{source}'")
 
-        # --- Lógica para determinar el límite a aplicar ---
+        # --- INICIO DE LA LÓGICA MEJORADA ---
+        # Convertimos el ID único en una lista para manejar todos los casos de la misma forma.
+        if isinstance(center_ids, int):
+            ids_a_procesar = [center_ids]
+        else:
+            ids_a_procesar = center_ids
+        # --- FIN DE LA LÓGICA MEJORADA ---
+
         default_limit_applied = False
         apply_limit = limit
-
-        # Si el usuario no pide ni un rango de fechas ni un límite, aplicamos uno por defecto.
         if limit is None and not start_date and not end_date:
-            apply_limit = 20  # Límite por defecto para una "vista previa"
+            apply_limit = 20
             default_limit_applied = True
-            logger.info(f"No se especificó rango ni límite. Aplicando límite por defecto de {apply_limit} registros.")
-
-        # --- Construcción del filtro ---
+        
         if source not in FULL_METRIC_MAP:
             return {"error": f"Fuente '{source}' no reconocida."}
 
-        match_filter = self._build_mongo_filter(center_id, source)
-        if not match_filter:
-            return {"error": f"No se pudo crear un filtro para el centro {center_id}."}
-
+        # --- LÓGICA DE FILTRO MEJORADA PARA MÚLTIPLES CENTROS ---
+        alias_values = []
+        for center_id in ids_a_procesar:
+            center = self._get_master_center_by_id(center_id)
+            if center:
+                alias = self._get_alias_value(center, source)
+                if alias:
+                    alias_values.append(alias)
+        
+        if not alias_values:
+            return {"error": "Ninguno de los IDs de centro proporcionados es válido."}
+            
         config = FULL_METRIC_MAP[source]
         collection = self.collections[source]
         date_field = config["fecha"]
+        center_name_field = config["center_name_field"]
+        
+        match_filter = {center_name_field: {"$in": alias_values}}
+        # --- FIN DE LÓGICA DE FILTRO MEJORADA ---
 
         if start_date and end_date:
-            try:
-                match_filter[date_field] = {"$gte": date_parser.parse(start_date), "$lte": date_parser.parse(end_date).replace(hour=23, minute=59, second=59)}
-            except ValueError:
-                return {"error": "Formato de fecha inválido. Use AAAA-MM-DD."}
+            match_filter[date_field] = {"$gte": date_parser.parse(start_date), "$lte": date_parser.parse(end_date).replace(hour=23, minute=59, second=59)}
 
-        # --- Construcción de la proyección de métricas ---
-        projection = {"_id": 0, "fecha": f"${date_field}"}
+        projection = {"_id": 0, "fecha": f"${date_field}", config["center_name_field"]: 1} # <-- Añadimos el nombre del centro al resultado
         valid_metrics_found = False
         for metric in metrics:
             if metric in config["metrics"]:
@@ -242,92 +270,117 @@ class ToolExecutor:
                 valid_metrics_found = True
 
         if not valid_metrics_found:
-            return {"error": f"Ninguna de las métricas {metrics} es válida para la fuente {source}."}
+            return {"error": f"Ninguna de las métricas {metrics} es válida."}
 
-        # --- Construcción y ejecución del Pipeline ---
-        pipeline = [
-            {"$match": match_filter},
-            {"$sort": {date_field: -1}}
-        ]
-
-        # Aplicamos el límite solo si es necesario
+        pipeline = [{"$match": match_filter}, {"$sort": {date_field: -1}}]
         if apply_limit:
             pipeline.append({"$limit": apply_limit})
 
-        pipeline.extend([
-            {"$project": projection},
-            {"$sort": {"fecha": 1}} # Re-ordenar cronológicamente para el frontend/IA
-        ])
-
+        pipeline.extend([{"$project": projection}, {"$sort": {"fecha": 1}}])
+        
         try:
             result = list(collection.aggregate(pipeline))
             if not result:
                 return {"count": 0, "data": [], "summary": "No se encontraron datos."}
-
-            # Devolvemos el resultado junto con la bandera que indica si se usó el límite por defecto
-            return {
-                "count": len(result),
-                "data": result,
-                "default_limit_used": default_limit_applied
-            }
+            return {"count": len(result), "data": result, "default_limit_used": default_limit_applied}
         except Exception as e:
             logger.error(f"Error en get_timeseries_data: {e}", exc_info=True)
             return {"error": "Ocurrió un error al consultar la base de datos."}
 
-    def correlate_timeseries_data(self, center_id: int, primary_source: str, primary_metrics: List[str], secondary_source: str, secondary_metrics: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: int = 100) -> dict:
-        """Correlaciona métricas de dos fuentes de datos distintas uniéndolas por día."""
+    def correlate_timeseries_data(self, center_id: int, primary_source: str, primary_metrics: List[str], secondary_source: str, secondary_metrics: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> dict:
+        """
+        Correlaciona métricas de dos fuentes distintas. Si no se especifican fechas,
+        encuentra automáticamente el período de tiempo donde ambos conjuntos de datos se superponen.
+        """
+        logger.info(f"Iniciando correlación para centro ID {center_id}: {primary_source} vs {secondary_source}")
+
+        # --- 1. Lógica para determinar el rango de fechas a consultar ---
+        final_start_date = start_date
+        final_end_date = end_date
+
+        if not start_date and not end_date:
+            logger.info("No se especificaron fechas. Buscando superposición de datos automáticamente.")
+            # Obtenemos los rangos de ambas fuentes
+            range1 = self.get_data_range_for_source(center_id, primary_source)
+            range2 = self.get_data_range_for_source(center_id, secondary_source)
+
+            if range1.get("has_data") and range2.get("has_data"):
+                # Calculamos la superposición (intersección) de los rangos
+                overlap_start = max(date_parser.parse(range1["first_record"]), date_parser.parse(range2["first_record"]))
+                overlap_end = min(date_parser.parse(range1["last_record"]), date_parser.parse(range2["last_record"]))
+
+                if overlap_start <= overlap_end:
+                    logger.info(f"Superposición encontrada: de {overlap_start.date()} a {overlap_end.date()}")
+                    final_start_date = overlap_start.strftime('%Y-%m-%d')
+                    final_end_date = overlap_end.strftime('%Y-%m-%d')
+                else:
+                    return {"error": "Se encontraron datos para ambas fuentes, pero no en el mismo período de tiempo. No se puede realizar la correlación."}
+            else:
+                return {"error": "No se encontraron datos suficientes en una o ambas fuentes para realizar la correlación."}
+
+        # --- 2. Lógica de Límite ---
+        default_limit_applied = False
+        apply_limit = limit
+        if limit is None and not final_start_date and not final_end_date:
+            apply_limit = 20
+            default_limit_applied = True
+
+        # --- 3. El resto de la función (casi idéntica, pero usando final_start_date) ---
         if primary_source not in FULL_METRIC_MAP or secondary_source not in FULL_METRIC_MAP:
             return {"error": "Una de las fuentes de datos no es válida."}
         
         master_center = self._get_master_center_by_id(center_id)
         if not master_center: return {"error": f"Centro con ID {center_id} no encontrado."}
 
-        primary_filter = self._build_mongo_filter(center_id, primary_source)
+        primary_alias_value = self._get_alias_value(master_center, primary_source)
         secondary_alias_value = self._get_alias_value(master_center, secondary_source)
         
-        if not primary_filter or not secondary_alias_value:
-            return {"error": f"No se pudieron obtener los aliases necesarios para la correlación en el centro {center_id}."}
+        if not primary_alias_value or not secondary_alias_value:
+            return {"error": f"No se pudieron obtener los aliases para la correlación."}
 
         p_config = FULL_METRIC_MAP[primary_source]
         s_config = FULL_METRIC_MAP[secondary_source]
         primary_collection = self.collections[primary_source]
-        
-        match_filter = primary_filter
-        if start_date and end_date:
-            match_filter[p_config["fecha"]] = {"$gte": date_parser.parse(start_date), "$lte": date_parser.parse(end_date).replace(hour=23, minute=59, second=59)}
 
+        match_filter = { p_config["center_name_field"]: primary_alias_value }
+        if final_start_date and final_end_date:
+            match_filter[p_config["fecha"]] = {"$gte": date_parser.parse(final_start_date), "$lte": date_parser.parse(final_end_date).replace(hour=23, minute=59, second=59)}
+        
+        # ... (El resto del pipeline de agregación con $lookup se mantiene exactamente igual)
         initial_project = {"_id": 0, "fecha": f"${p_config['fecha']}", **{metric: p_config["metrics"][metric] for metric in primary_metrics if metric in p_config["metrics"]}}
         secondary_projection = {"_id": 0, **{metric: s_config["metrics"][metric] for metric in secondary_metrics if metric in s_config["metrics"]}}
-
         lookup_stage = {
             "$lookup": {
                 "from": self.collections[secondary_source].name,
                 "let": {"primary_date": "$fecha"},
                 "pipeline": [
-                    {"$match": {
-                        s_config["center_name_field"]: secondary_alias_value,
-                        "$expr": {"$eq": [{"$dateToString": {"format": "%Y-%m-%d", "date": f"${s_config['fecha']}"}}, {"$dateToString": {"format": "%Y-%m-%d", "date": "$$primary_date"}}]}
-                    }},
+                    {"$match": { "$expr": { "$and": [
+                        {"$eq": [f"${s_config['center_name_field']}", secondary_alias_value]},
+                        {"$eq": [{"$dateToString": {"format": "%Y-%m-%d", "date": f"${s_config['fecha']}"}}, {"$dateToString": {"format": "%Y-%m-%d", "date": "$$primary_date"}}]}
+                    ]}}},
                     {"$project": secondary_projection}
                 ],
                 "as": "correlated_data"
             }
         }
-        
         final_project = {"_id": 0, "fecha": 1, **{metric: 1 for metric in primary_metrics}, **{metric: 1 for metric in secondary_metrics}}
-
-        pipeline = [
-            {"$match": match_filter}, {"$sort": {p_config["fecha"]: -1}}, {"$limit": limit},
-            {"$project": initial_project},
-            lookup_stage,
+        pipeline = [{"$match": match_filter}, {"$sort": {p_config["fecha"]: -1}}]
+        if apply_limit: pipeline.append({"$limit": apply_limit})
+        pipeline.extend([
+            {"$project": initial_project}, lookup_stage,
             {"$unwind": {"path": "$correlated_data", "preserveNullAndEmptyArrays": True}},
             {"$replaceRoot": {"newRoot": {"$mergeObjects": ["$$ROOT", "$correlated_data"]}}},
             {"$project": final_project}, {"$sort": {"fecha": 1}}
-        ]
+        ])
 
         try:
             result = list(primary_collection.aggregate(pipeline))
-            return {"count": len(result), "data": result}
+            return {
+                "count": len(result),
+                "data": result,
+                "default_limit_used": default_limit_applied,
+                "date_range_used": f"{final_start_date} a {final_end_date}" if final_start_date else "Últimos registros"
+            }
         except Exception as e:
             logger.error(f"Error en la correlación de datos: {e}", exc_info=True)
             return {"error": "No se pudieron correlacionar los datos."}
@@ -679,4 +732,67 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"Error calculando la tasa de mortalidad: {e}")
             return {"error": "Error al calcular la tasa de mortalidad."}
+    # En data_tools.py, REEMPLAZA tu función get_monthly_aggregation
+# y ELIMINA get_monthly_summary_for_all_centers
+
+    def get_monthly_aggregation(self, source: str, metrics: List[str], aggregation: str, center_ids: Optional[List[int]] = None, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> dict:
+        """
+        Calcula una agregación mensual (suma o promedio) para una LISTA de métricas.
+        Puede filtrar por uno, varios o todos los centros.
+        """
+        logger.info(f"Calculando '{aggregation}' mensual para centros {center_ids or 'TODOS'}, métricas: {metrics}")
+
+        MONGO_AGG_OPERATORS = {"sum": "$sum", "avg": "$avg"}
+        mongo_operator = MONGO_AGG_OPERATORS.get(aggregation.lower())
+        if not mongo_operator: return {"error": f"Agregación no válida: '{aggregation}'."}
+        if source not in FULL_METRIC_MAP: return {"error": f"Fuente '{source}' no reconocida."}
+
+        config = FULL_METRIC_MAP[source]
+        collection = self.collections[source]
+        date_field = config["fecha"]
+        center_name_field = config["center_name_field"]
+        
+        match_filter = {}
+        if center_ids:
+            alias_values = []
+            for center_id in center_ids:
+                center = self._get_master_center_by_id(center_id)
+                if center:
+                    alias = self._get_alias_value(center, source)
+                    if alias: alias_values.append(alias)
+            if not alias_values: return {"error": "Ningún ID de centro proporcionado es válido."}
+            match_filter[center_name_field] = {"$in": alias_values}
+
+        if start_date and end_date:
+            match_filter[date_field] = {"$gte": date_parser.parse(start_date), "$lte": date_parser.parse(end_date).replace(hour=23, minute=59, second=59)}
+
+        group_stage = {"_id": {"centro": f"${center_name_field}", "year": {"$year": f"${date_field}"}, "month": {"$month": f"${date_field}"}}}
+        project_stage = {"_id": 0, "centro": "$_id.centro", "periodo": {"$concat": [{"$toString": "$_id.year"}, "-", {"$toString": "$_id.month"}]}}
+
+        for metric in metrics:
+            if metric in config["metrics"]:
+                metric_db_field = config["metrics"][metric].replace('$', '')
+                group_stage[f"val_{metric}"] = {mongo_operator: f"${metric_db_field}"}
+                project_stage[metric] = {"$round": [f"$val_{metric}", 2]}
+        
+        if len(project_stage) <= 2: return {"error": f"Ninguna de las métricas {metrics} es válida."}
+
+        pipeline = [
+            {"$match": match_filter}, {"$group": group_stage},
+            {"$sort": {"_id.year": -1, "_id.month": -1}},
+        ]
+        if limit:
+            pipeline.append({"$limit": limit})
+        
+        pipeline.extend([
+            {"$sort": {"_id.centro": 1, "_id.year": 1, "_id.month": 1}},
+            {"$project": project_stage}
+        ])
+        
+        try:
+            result = list(collection.aggregate(pipeline))
+            return {"count": len(result), "data": result}
+        except Exception as e:
+            logger.error(f"Error en la agregación mensual: {e}")
+            return {"error": "Error al calcular la agregación mensual."}    
         

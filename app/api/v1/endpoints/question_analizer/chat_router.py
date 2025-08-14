@@ -76,10 +76,11 @@ def clima_simple(
     ):
     
     segunda_clave = list(json_data.keys())[1]
-    registro = json_data[segunda_clave]["data"][0]
+    registro = json_data[segunda_clave]["data"]
     
     if not registro:
         return None
+    registro = registro[0]
 
     precip = float(registro.get("precipitacion", 0) or 0)
     temp = float(registro.get("temperatura", registro.get("temperatura_maxima", 0)) or 0)
@@ -95,7 +96,7 @@ def clima_simple(
     if usar_viento and viento >= viento_fuerte and temp <= temp_fresca:
         estado = "nublado"
 
-    return estado
+    return "nublado"
 
 @router.post("/analyze-question/", response_model=FinalResponse)
 async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depends(get_db)):
@@ -205,7 +206,7 @@ async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depe
             "answer": final_text,
             "timestamp": datetime.now()
         })
-    
+        
     def estructura_clima_1_centros(collected_data):
         #restructurar json
         primera_clave = list(collected_data.keys())[0]
@@ -287,7 +288,7 @@ async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depe
         chart=final_chart_object,
         debug_context=collected_data
     )
-
+    
 class AudioResponse(BaseModel):
     text: str
     
