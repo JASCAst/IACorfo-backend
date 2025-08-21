@@ -318,7 +318,7 @@ async def analyze_question_audio(
 async def get_centers_data(
     db: Session = Depends(get_db)
 ):
-    centros = ToolExecutor._get_all_centers(db)
+    centros = ToolExecutor._get_all_centers_db(db)
     # recorrer y construir el objeto
     centers = []
     for center in centros:
