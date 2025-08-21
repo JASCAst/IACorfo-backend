@@ -16,8 +16,8 @@ from app.api.v1.endpoints import pdf_data_extractor # Importar el router de extr
 # from app.api.v1.endpoints.question_analizer import chat_router as question_analyzer_router
 
 # Por esta:
-
 from app.api.v1.endpoints.question_analizer.chat_router import router as question_analyzer_router
+from app.api.v1.endpoints.data import router as data_router
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
@@ -43,3 +43,5 @@ api_router.include_router(
     prefix="/question-analyzer",
     tags=["Question Analyzer (New)"]
 )
+
+api_router.include_router(data_router, tags=["data"])

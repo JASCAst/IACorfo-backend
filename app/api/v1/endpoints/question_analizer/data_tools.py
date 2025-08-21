@@ -67,7 +67,7 @@ class ToolExecutor:
         """Función auxiliar para obtener un objeto de centro desde la DB relacional."""
         return self.db.query(MasterCenter).filter(MasterCenter.id == center_id).first()
 
-    def _get_all_centers(db: Session):
+    def _get_all_centers_db(db: Session):
         centers = db.query(MasterCenter).all()
         return centers
 
@@ -449,7 +449,7 @@ class ToolExecutor:
         """
         logger.info(f"Calculando '{aggregation}' mensual para centro ID {center_id}, métricas: {metrics}")
 
-        MONGO_AGG_OPERATORS = {"sum": "$sum", "avg": "$avg"}
+        MONGO_AGG_OPERATORS = {"sum": "$sum", "avg": "$avg","max":"$max","min":"$min"}
         mongo_operator = MONGO_AGG_OPERATORS.get(aggregation.lower())
         if not mongo_operator:
             return {"error": f"Tipo de agregación no válido: '{aggregation}'. Usar 'sum' o 'avg'."}
