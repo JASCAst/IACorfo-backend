@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import create_tables
 from app.api.v1.api import api_router
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from .api.v1.endpoints.data import generar_resumen as generar_resumen
 
 # Crear tablas en la base de datos
 create_tables()
@@ -53,3 +57,10 @@ if __name__ == "__main__":
         port=settings.port,
         reload=settings.debug
     )
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(
+    generar_resumen,
+    CronTrigger(day_of_week="mon", hour=9, minute=0),  # lunes 9:00 AM
+)
+scheduler.start()

@@ -25,6 +25,10 @@ PLANNER_SYSTEM_PROMPT_LINES = [
     "3.  `\"store_result_as\"`: Un nombre de variable único (string) para guardar el resultado. ESTA CLAVE ES OBLIGATORIA EN CADA PASO, SIN EXCEPCIONES.",
     "",
     "--- REGLAS DE ORO (SECUENCIALES) ---",
+    "**REGLA #-1: MANEJO DE PREGUNTAS MÚLTIPLES O COMPLEJAS (MÁXIMA PRIORIDAD)**",
+    "Si la pregunta del usuario es una lista de preguntas (numerada o con viñetas) o contiene múltiples solicitudes claramente distintas (más de 2 o 3), DEBES IGNORAR TODAS LAS OTRAS REGLAS. Tu única tarea es usar la herramienta `direct_answer` para pedirle al usuario que haga una pregunta a la vez.",
+    '**Ejemplo:** `{"plan": [{"tool": "direct_answer", "parameters": {"response": "He notado que tu consulta tiene varias preguntas. Para poder darte la mejor respuesta y no omitir detalles, ¿podrías hacer una pregunta a la vez, por favor?"}, "store_result_as": "respuesta_guia"}]}`',
+    "",
     "**REGLA #0: MANEJO DE SALUDOS Y DESPEDIDAS (MÁXIMA PRIORIDAD)**",
     "Si la pregunta es un simple saludo ('hola') o despedida ('adiós'), usa la herramienta `direct_answer` con una respuesta corta y amigable.",
     '**Ejemplo para "hola":** `{"plan": [{"tool": "direct_answer", "parameters": {"response": "¡Hola! ¿En qué puedo ayudarte hoy?"}, "store_result_as": "respuesta_directa"}]}`',
@@ -39,6 +43,7 @@ PLANNER_SYSTEM_PROMPT_LINES = [
     "**REGLA #3: MANEJO DE AMBIGÜEDAD DE CENTRO:** Si la pregunta requiere datos de un centro pero el usuario NO especifica uno, tu ÚNICO trabajo es crear un plan de un solo paso para llamar a `get_all_centers` (Y DEBES INCLUIR `store_result_as`).",
     "**REGLA #4: IDENTIFICACIÓN DE CENTRO:** Si la pregunta SÍ menciona un nombre de centro (ej: 'Pirquen'), el PRIMER paso del plan DEBE ser `get_center_id_by_name` (Y DEBES INCLUIR `store_result_as`).",
     "**REGLA #5: VERIFICACIÓN DE DATOS POR CENTRO:** Si el usuario pregunta qué centros tienen datos para una fuente específica (ej: 'qué centros tienen datos de clima', 'dime para qué centros tienes alimentación'), DEBES usar la herramienta especializada `find_centers_with_data`. NO uses `get_all_centers`.",
+    "**REGLA #6: GRANULARIDAD A NIVEL DE JAULA:** Si la pregunta del usuario menciona explícitamente 'jaula', 'jaulas' o 'unidad', DEBES utilizar las 'Herramientas Específicas de Jaulas'. Primero, identifica las jaulas relevantes con `get_active_cages_for_center` y luego usa sus resultados para consultar detalles con otras herramientas relacionadas a jaulas si es necesario.",
     "",
     "--- REGLAS DE INTERPRETACIÓN DE MÉTRICAS ---",
     "1.  **NUNCA INVENTES MÉTRICAS:** Solo puedes usar los nombres de métricas exactos listados abajo.",
@@ -121,6 +126,23 @@ PLANNER_SYSTEM_PROMPT_LINES = [
     '    }',
     '  ]',
     '}',
+    "**D. Herramientas Específicas de Jaulas (Unidades):**",
+    "10. `get_active_cages_for_center(center_id, start_date, end_date)`",
+    "   * **Para qué sirve:** Devuelve una lista de los números de jaula que estuvieron operativas en un centro.",
+    "   * **Cuándo usarla:** OBLIGATORIO si el usuario pregunta 'cuántas jaulas', 'qué jaulas' o 'lista de unidades'.",
+    "",
+    "11. `get_cage_initial_data(center_id, cage_ids: List[int])`",
+    "   * **Para qué sirve:** Obtiene el número de peces sembrados y el peso inicial para una o varias jaulas específicas.",
+    "   * **Cuándo usarla:** OBLIGATORIO para preguntas como 'cuántos peces se ingresaron por jaula' o 'peso de siembra'.",
+    # ... (después de la herramienta 11 que agregamos antes) ...
+
+    "12. `get_monthly_aggregation_for_cages(center_id, cage_ids: List[int], metrics: List[str], aggregation: str)`",
+    "   * **Para qué sirve:** Es la herramienta principal para analizar el rendimiento de jaulas específicas. Calcula agregados mensuales (suma, promedio) para KPIs como 'sgr', 'fcr_biologico', 'mortalidad', 'alimento_total'.",
+    "   * **Cuándo usarla:** OBLIGATORIO para preguntas sobre la evolución o el promedio de cualquier métrica a nivel de jaula. Úsala para comparar el rendimiento entre jaulas.",
+    "",
+    "13. `get_cage_harvest_data(center_id, cage_ids: List[int])`",
+    "   * **Para qué sirve:** Calcula el número total de peces cosechados de una o varias jaulas. IMPORTANTE: Lo hace calculando (Peces Ingresados - % Mortalidad Final).",
+    "   * **Cuándo usarla:** OBLIGATORIO si el usuario pregunta por 'cosecha', 'peces cosechados' o 'salidas de peces'.",
     "```"
 ]
 PLANNER_SYSTEM_PROMPT = "\n".join(PLANNER_SYSTEM_PROMPT_LINES)
