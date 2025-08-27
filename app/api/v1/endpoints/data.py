@@ -3,6 +3,8 @@ from pymongo import MongoClient
 from app.core.config import settings
 from datetime import datetime, timedelta
 from collections import defaultdict
+import math
+import re
 
 
 router = APIRouter()
@@ -12,7 +14,9 @@ mongo_db_client = MongoClient(settings.mongo_uri)
 wisensor_db = mongo_db_client[settings.mongo_db_name]
 alimentacion_col = wisensor_db["alimentacionV2"]
 alimentacion_col_original = wisensor_db["alimentacion"]
+alimentacion_resumida = wisensor_db["alimentacion_resumen"]
 clima_col = wisensor_db["climaV2"]
+# Colección resumen/cache
 
 
 # Mapeo entre colecciones
@@ -524,20 +528,352 @@ def calculoCiclo(alim_centro: str, clima_centro: str):
         }
     }
 
-@router.get("/dashboard/data")
-async def get_series():
-    resultados =[]
-    for alim_centro, clima_centro in CENTRO_MAP.items():
-        semanal = calculoSemanal(alim_centro, clima_centro)
-        ciclos = calculoCiclo(alim_centro, clima_centro)
-        promedio = calculoPromedio(alim_centro, clima_centro)
+# @router.get("/dashboard/data")
+# async def get_series():
+#     resultados =[]
+#     for alim_centro, clima_centro in CENTRO_MAP.items():
+#         semanal = calculoSemanal(alim_centro, clima_centro)
+#         ciclos = calculoCiclo(alim_centro, clima_centro)
+#         promedio = calculoPromedio(alim_centro, clima_centro)
         
-        resultados.append({
-            "nombreCentro": clima_centro,
-            "semanales": semanal,
-            "ciclos": ciclos,
-            "promedios": promedio
-        })
+#         resultados.append({
+#             "nombreCentro": clima_centro,
+#             "semanales": semanal,
+#             "ciclos": ciclos,
+#             "promedios": promedio
+#         })
 
-    return resultados
+#     return resultados
+
+def generar_resumen():
+    cursor = alimentacion_col_original.find(
+        {},
+        {"Name": 1, "Dia": 1, "gramspersec": 1, "Biomasa": 1, "PesoProm": 1}
+    ).sort([("Name", 1), ("Dia", 1)])
+
+    data = {}
+
+    for doc in cursor:
+        name = doc["Name"]
+        m = re.search(r"(S\d+(?: \[[^]]+\])?|C\d+(?: \[[^]]+\])?)", name)
+        if not m:
+            continue
+        ciclo_match = m.group(0)
+        centro = name.replace(ciclo_match, "").strip()
+
+        mes = doc["Dia"].month
+        fecha_str = doc["Dia"].strftime("%Y-%m-%d")
+
+        if centro not in data:
+            data[centro] = {}
+        if ciclo_match not in data[centro]:
+            data[centro][ciclo_match] = {
+                "fecha_inicio": doc["Dia"],
+                "fecha_termino": doc["Dia"],
+                "meses": {}
+            }
+
+        # Actualizar fechas de inicio y término
+        if doc["Dia"] < data[centro][ciclo_match]["fecha_inicio"]:
+            data[centro][ciclo_match]["fecha_inicio"] = doc["Dia"]
+        if doc["Dia"] > data[centro][ciclo_match]["fecha_termino"]:
+            data[centro][ciclo_match]["fecha_termino"] = doc["Dia"]
+
+        # Crear mes si no existe
+        if mes not in data[centro][ciclo_match]["meses"]:
+            data[centro][ciclo_match]["meses"][mes] = {
+                "consumo_alimentos": {},
+                "fcrPromedio": {},
+                "SGR": {},
+                "SFR": {}
+            }
+
+        # Acumular consumo por día
+        data[centro][ciclo_match]["meses"][mes]["consumo_alimentos"].setdefault(fecha_str, 0)
+        data[centro][ciclo_match]["meses"][mes]["consumo_alimentos"][fecha_str] += doc.get("gramspersec", 0)
+
+        # Variables para métricas
+        biomasa = doc.get("Biomasa", 0)
+        peso_prom = doc.get("PesoProm", 0)
+        consumo = data[centro][ciclo_match]["meses"][mes]["consumo_alimentos"][fecha_str]
+
+        # Calcular métricas (aproximadas)
+        fcr = (consumo / biomasa) if biomasa > 0 else 0
+        sgr = (math.log(peso_prom + 1) * 100) if peso_prom > 0 else 0
+        sfr = (consumo / biomasa * 100) if biomasa > 0 else 0
+
+        # Guardar métricas por día
+        data[centro][ciclo_match]["meses"][mes]["fcrPromedio"][fecha_str] = fcr
+        data[centro][ciclo_match]["meses"][mes]["SGR"][fecha_str] = sgr
+        data[centro][ciclo_match]["meses"][mes]["SFR"][fecha_str] = sfr
+
+        #Agregar nombre a cada una de las metricas
+        data[centro][ciclo_match]["meses"][mes]["consumo_alimentos"]["nombre"] = "Consumo Alimentos"
+        data[centro][ciclo_match]["meses"][mes]["fcrPromedio"]["nombre"] = "FCR Mensual"
+        data[centro][ciclo_match]["meses"][mes]["SGR"]["nombre"] = "SGR Mensual"
+        data[centro][ciclo_match]["meses"][mes]["SFR"]["nombre"] = "SFR Mensual"
+
+    # Transformar a documentos finales
+    def fmt(d):
+        return d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d
+
+    for centro, ciclos in data.items():
+        ciclos_list = []
+        for ciclo, ciclo_info in ciclos.items():
+            meses_list = []
+            for idMes in sorted(ciclo_info["meses"].keys()):
+                mes_info = ciclo_info["meses"][idMes]
+                meses_list.append({
+                    "idMes": idMes,
+                    "datos": mes_info
+                })
+            ciclos_list.append({
+                "id_ciclo": ciclo,
+                "fecha_inicio": fmt(ciclo_info["fecha_inicio"]),
+                "fecha_termino": fmt(ciclo_info["fecha_termino"]),
+                "meses": meses_list
+            })
+
+        resumen_doc = {
+            "nombreCentro": centro,
+            "ciclos": ciclos_list
+        }
+
+        alimentacion_resumida.replace_one(
+            {"nombreCentro": resumen_doc["nombreCentro"]},
+            resumen_doc,
+            upsert=True
+        )
+
+def resumen_alimentacion():
+    try:
+        pipeline = [
+            # Etapa 1: Añadir campos auxiliares y ordenar por fecha.
+            {
+                "$addFields": {
+                    "nombreCentro": { "$arrayElemAt": [{"$split": ["$Name", " "]}, 0] },
+                    "id_ciclo": { 
+                        "$trim": {
+                            "input": {
+                                "$reduce": {
+                                    "input": {"$slice": [{"$split": ["$Name", " "]}, 1, {"$size": {"$split": ["$Name", " "]}}]},
+                                    "initialValue": "",
+                                    "in": {"$concat": ["$$value", " ", "$$this"]}
+                                }
+                            }
+                        } 
+                    },
+                    "dia_fecha": { "$dateToString": { "format": "%Y-%m-%d", "date": "$Dia" } },
+                    "año_mes": { "$dateToString": { "format": "%Y-%m", "date": "$Dia" } }
+                }
+            },
+            # Ordenar los documentos por fecha para capturar los valores iniciales y finales correctamente.
+            { "$sort": { "Dia": 1 } },
+            # Etapa 2: Agrupar por día para resumir el consumo y obtener métricas.
+            {
+                "$group": {
+                    "_id": {
+                        "centro": "$nombreCentro",
+                        "ciclo": "$id_ciclo",
+                        "dia": "$dia_fecha",
+                        "mes": "$año_mes"
+                    },
+                    "consumo_total_diario": { "$sum": "$AmountGrams" },
+                    "biomasa_inicial_dia": { "$first": "$Biomasa" },
+                    "biomasa_final_dia": { "$last": "$Biomasa" },
+                    "pesoprom_inicial_dia": { "$max": "$PesoProm" },
+                    "pesoprom_final_dia": { "$max": "$PesoProm" },
+                    "alimento_suministrado_diario": { "$sum": "$AmountSupplied" },
+                    "muertes_diarias": { "$sum": "$MortalityCount" }
+                }
+            },
+            # Etapa 3: Calcular las métricas FCR, SGR y SFR por día, incluyendo las nuevas.
+            {
+                "$addFields": {
+                    "ganancia_peso": { "$subtract": ["$biomasa_final_dia", "$biomasa_inicial_dia"] },
+                    "FCR": { 
+                        "$cond": [ 
+                            { "$gt": ["$ganancia_peso", 0] }, 
+                            { "$divide": ["$consumo_total_diario", "$ganancia_peso"] }
+                        ] 
+                    },
+                    "SGR": { 
+                        "$cond": [
+                            { "$and": [
+                                { "$gt": ["$pesoprom_inicial_dia", 0] },
+                                { "$gt": ["$pesoprom_final_dia", 0] }
+                            ] },
+                            { "$multiply": [ 
+                                { "$divide": [ 
+                                    { "$subtract": [ 
+                                        { "$ln": "$pesoprom_final_dia" }, 
+                                        { "$ln": "$pesoprom_inicial_dia" } 
+                                    ] }, 
+                                    1 
+                                ] }, 
+                                100 
+                            ] },
+                            None 
+                        ]
+                    },
+                    "SFR": {
+                        "$cond": [
+                            { "$gt": ["$biomasa_final_dia", 0] },
+                            { "$multiply": [ { "$divide": ["$consumo_total_diario", "$biomasa_final_dia"] }, 100 ] },
+                            None
+                        ]
+                    },
+                    "descarte": {
+                        "$cond": [
+                            { "$gt": ["$alimento_suministrado_diario", 0] },
+                            { "$multiply": [ { "$divide": [ { "$subtract": ["$alimento_suministrado_diario", "$consumo_total_diario"] }, "$alimento_suministrado_diario" ] }, 100 ] },
+                            None
+                        ]
+                    },
+                    "mortalidad": {
+                        "$cond": [
+                            { "$gt": ["$muertes_diarias", 0] },
+                            { "$multiply": [ { "$divide": ["$muertes_diarias", { "$sum": ["$biomasa_inicial_dia", "$muertes_diarias"] } ] }, 100 ] },
+                            None
+                        ]
+                    }
+                }
+            },
+            # Etapa 4: Agrupar por mes y consolidar los datos diarios en arrays separados.
+            {
+                "$group": {
+                    "_id": {
+                        "centro": "$_id.centro",
+                        "ciclo": "$_id.ciclo",
+                        "mes": "$_id.mes"
+                    },
+                    "consumo_alimentos": {
+                        "$push": {
+                            "fecha": "$_id.dia",
+                            "consumo_total_diario": "$consumo_total_diario"
+                        }
+                    },
+                    "FCR": {
+                        "$push": {
+                            "fecha": "$_id.dia",
+                            "valor": "$FCR"
+                        }
+                    },
+                    "SGR": {
+                        "$push": {
+                            "fecha": "$_id.dia",
+                            "valor": "$SGR"
+                        }
+                    },
+                    "SFR": {
+                        "$push": {
+                            "fecha": "$_id.dia",
+                            "valor": "$SFR"
+                        }
+                    },
+                    "descarte": {
+                        "$push": {
+                            "fecha": "$_id.dia",
+                            "valor": "$descarte"
+                        }
+                    },
+                    "mortalidad": {
+                        "$push": {
+                            "fecha": "$_id.dia",
+                            "valor": "$mortalidad"
+                        }
+                    }
+                }
+            },
+            # Etapa 5: Consolidar los meses en un ciclo.
+            {
+                "$group": {
+                    "_id": {
+                        "centro": "$_id.centro",
+                        "ciclo": "$_id.ciclo"
+                    },
+                    "fecha_inicio_ciclo": { "$min": "$_id.mes" },
+                    "fecha_termino_ciclo": { "$max": "$_id.mes" },
+                    "meses": {
+                        "$push": {
+                            "idMes": "$_id.mes",
+                            "consumo_alimentos": {
+                                "nombre":"Consumo Alimentos",
+                                "fechas": "$consumo_alimentos"
+                            },
+                            "FCR": {
+                                "nombre": "FCR Mensual",
+                                "fechas": "$FCR"
+                            },
+                            "SGR": {
+                                "nombre": "SGR Mensual",
+                                "fechas": "$SGR"
+                            },
+                            "SFR": {
+                                "nombre": "SFR Mensual",
+                                "fechas": "$SFR"
+                            },
+                            "descarte": {
+                                "nombre": "Descarte Mensual",
+                                "fechas": "$descarte"
+                            },
+                            "mortalidad": {
+                                "nombre": "Mortalidad Mensual",
+                                "fechas": "$mortalidad"
+                            }
+                        }
+                    }
+                }
+            },
+            # Etapa 6: Consolidar los ciclos en un centro.
+            {
+                "$group": {
+                    "_id": "$_id.centro",
+                    "ciclos": {
+                        "$push": {
+                            "id_ciclo": "$_id.ciclo",
+                            "fecha_inicio": "$fecha_inicio_ciclo",
+                            "fecha_termino": "$fecha_termino_ciclo",
+                            "meses": "$meses"
+                        }
+                    }
+                }
+            },
+            # Etapa 7: Proyectar el resultado final.
+            {
+                "$project": {
+                    "_id": 0,
+                    "nombreCentro": "$_id",
+                    "ciclos": "$ciclos"
+                }
+            }
+        ]
+        
+        resumen = list(alimentacion_col_original.aggregate(pipeline, allowDiskUse=True))
+        
+        alimentacion_resumida.delete_many({})
+        if resumen:
+            alimentacion_resumida.insert_many(resumen)
+            
+        return {"message": "Datos de alimentación resumidos y guardados con éxito.", "total_documentos": len(resumen)}
+
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/dashboard/data")
+async def cargar_data():
+    try:
+        cached = list(alimentacion_resumida.find({}, {"_id": 0}))
+        return cached
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/ejecutarResumen")
+async def ejecutar_resumen():
+    return resumen_alimentacion()
+
+
+
+
 

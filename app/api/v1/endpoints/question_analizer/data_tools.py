@@ -796,3 +796,179 @@ class ToolExecutor:
             logger.error(f"Error en la agregación mensual: {e}")
             return {"error": "Error al calcular la agregación mensual."}    
         
+    def get_active_cages_for_center(self, center_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
+        """
+        Obtiene una lista de las jaulas ('Unidad') únicas que tuvieron registros
+        para un centro en un período de tiempo opcional.
+        """
+        logger.info(f"Buscando jaulas activas para el centro ID {center_id}")
+        source = "alimentacion"
+        match_filter = self._build_mongo_filter(center_id, source)
+        if not match_filter: return {"error": "No se pudo crear filtro para el centro."}
+
+        config = FULL_METRIC_MAP[source]
+        collection = self.collections[source]
+        date_field = config["fecha"]
+
+        if start_date and end_date:
+            match_filter[date_field] = {"$gte": date_parser.parse(start_date), "$lte": date_parser.parse(end_date)}
+
+        try:
+            # Usamos distinct para obtener los valores únicos del campo "Unidad"
+            cages = collection.distinct("Unidad", match_filter)
+            return {"count": len(cages), "cage_ids": sorted(cages)}
+        except Exception as e:
+            logger.error(f"Error al buscar jaulas activas: {e}")
+            return {"error": "No se pudieron obtener las jaulas activas."}
+
+    def get_cage_initial_data(self, center_id: int, cage_ids: List[int]) -> dict:
+        """
+        Obtiene los datos iniciales (peces ingresados y peso promedio inicial) para
+        una lista específica de jaulas en un centro.
+        """
+        logger.info(f"Buscando datos iniciales para jaulas {cage_ids} en centro {center_id}")
+        source = "alimentacion"
+        match_filter = self._build_mongo_filter(center_id, source)
+        if not match_filter: return {"error": "No se pudo crear filtro para el centro."}
+
+        # Añadimos el filtro para las jaulas específicas
+        match_filter["Unidad"] = {"$in": cage_ids}
+
+        collection = self.collections[source]
+        date_field = FULL_METRIC_MAP[source]["fecha"]
+
+        # Como el número de ingreso es el mismo, lo tomamos del primer registro de cada jaula
+        pipeline = [
+            {"$match": match_filter},
+            {"$sort": {date_field: 1}}, # Ordenamos por fecha ascendente
+            {"$group": {
+                "_id": "$Unidad",
+                "peces_ingresados": {"$first": "$Número Ingreso"},
+                "peso_inicial_gr": {"$first": "$Desarrollo del Peso Promedio"}
+            }},
+            {"$project": {
+                "_id": 0,
+                "jaula": "$_id",
+                "peces_ingresados": 1,
+                "peso_inicial_gr": 1
+            }},
+            {"$sort": {"jaula": 1}}
+        ]
+        try:
+            result = list(collection.aggregate(pipeline))
+            return {"count": len(result), "data": result}
+        except Exception as e:
+            logger.error(f"Error obteniendo datos iniciales de jaulas: {e}")
+            return {"error": "Error al consultar los datos iniciales de las jaulas."}
+    def get_monthly_aggregation_for_cages(self, center_id: int, cage_ids: List[int], metrics: List[str], aggregation: str) -> dict:
+        """
+        Calcula una agregación mensual para una lista de métricas y una lista de jaulas.
+        """
+        logger.info(f"Calculando '{aggregation}' mensual para jaulas {cage_ids} en centro {center_id}")
+        source = "alimentacion"
+
+        MONGO_AGG_OPERATORS = {"sum": "$sum", "avg": "$avg", "max": "$max", "min": "$min"}
+        mongo_operator = MONGO_AGG_OPERATORS.get(aggregation.lower())
+        if not mongo_operator:
+            return {"error": f"Agregación no válida: '{aggregation}'. Usar 'sum', 'avg', 'max' o 'min'."}
+
+        match_filter = self._build_mongo_filter(center_id, source)
+        if not match_filter: return {"error": "No se pudo crear filtro para el centro."}
+
+        # Añadimos el filtro para las jaulas específicas
+        match_filter["Unidad"] = {"$in": cage_ids}
+
+        config = FULL_METRIC_MAP[source]
+        collection = self.collections[source]
+        date_field = config["fecha"]
+
+        # Agrupamos por Jaula (Unidad) y por mes/año
+        group_stage = {
+            "_id": {
+                "jaula": "$Unidad",
+                "year": {"$year": f"${date_field}"},
+                "month": {"$month": f"${date_field}"}
+            }
+        }
+        project_stage = {
+            "_id": 0,
+            "jaula": "$_id.jaula",
+            "periodo": {"$concat": [{"$toString": "$_id.year"}, "-", {"$toString": "$_id.month"}]}
+        }
+
+        # Construir dinámicamente las métricas a agregar
+        valid_metrics = 0
+        for metric in metrics:
+            if metric in config["metrics"]:
+                metric_db_field = config["metrics"][metric].replace('$', '')
+                group_stage[f"val_{metric}"] = {mongo_operator: f"${metric_db_field}"}
+                project_stage[metric] = {"$round": [f"$val_{metric}", 2]}
+                valid_metrics += 1
+
+        if valid_metrics == 0:
+            return {"error": f"Ninguna de las métricas {metrics} es válida."}
+
+        pipeline = [
+            {"$match": match_filter},
+            {"$group": group_stage},
+            {"$sort": {"_id.jaula": 1, "_id.year": 1, "_id.month": 1}},
+            {"$project": project_stage}
+        ]
+
+        try:
+            result = list(collection.aggregate(pipeline))
+            return {"count": len(result), "data": result}
+        except Exception as e:
+            logger.error(f"Error en agregación mensual por jaula: {e}")
+            return {"error": "Error al calcular la agregación mensual por jaula."}
+    def get_cage_harvest_data(self, center_id: int, cage_ids: List[int]) -> dict:
+        """
+        Calcula el total de peces cosechados para una lista de jaulas.
+        La lógica es: (Peces Ingresados) - (% Mortalidad Final * Peces Ingresados).
+        """
+        logger.info(f"Calculando cosecha (ingresos - mortalidad) para jaulas {cage_ids} en centro {center_id}")
+        source = "alimentacion"
+        match_filter = self._build_mongo_filter(center_id, source)
+        if not match_filter: return {"error": "No se pudo crear filtro para el centro."}
+
+        match_filter["Unidad"] = {"$in": cage_ids}
+
+        collection = self.collections[source]
+        date_field = FULL_METRIC_MAP[source]["fecha"]
+
+        pipeline = [
+            {"$match": match_filter},
+            # Ordenamos por fecha para obtener el primer ingreso y la última mortalidad
+            {"$sort": {date_field: 1}},
+            {"$group": {
+                "_id": "$Unidad",
+                # El número de ingreso es el mismo, lo tomamos del primer registro
+                "peces_ingresados": {"$first": "$Número Ingreso"},
+                # La mortalidad acumulada final estará en el último registro
+                "mortalidad_final_porcentaje": {"$last": "$Mortalidad"}
+            }},
+            {"$project": {
+                "_id": 0,
+                "jaula": "$_id",
+                "peces_ingresados": "$peces_ingresados",
+                "mortalidad_final_porcentaje": "$mortalidad_final_porcentaje",
+                "total_peces_cosechados": {
+                    "$round": [ # Redondeamos el resultado final
+                        {"$subtract": [
+                            "$peces_ingresados",
+                            {"$multiply": [
+                                "$peces_ingresados",
+                                {"$divide": ["$mortalidad_final_porcentaje", 100]}
+                            ]}
+                        ]}
+                    ]
+                }
+            }},
+            {"$sort": {"jaula": 1}}
+        ]
+        try:
+            result = list(collection.aggregate(pipeline))
+            return {"count": len(result), "data": result}
+        except Exception as e:
+            logger.error(f"Error obteniendo datos de cosecha calculados: {e}")
+            return {"error": "Error al calcular los datos de cosecha."}

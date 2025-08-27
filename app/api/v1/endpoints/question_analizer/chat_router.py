@@ -247,7 +247,7 @@ async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depe
                                             ],
                                             "color": "blue",
                                             "zoom": 8,
-                                            "clima" : "soleado"
+                                            "clima" : "nublado"
                                         }
         estructura_clima_2_centros(collected_data)
     elif "polocuhe_info" in collected_data:
@@ -262,7 +262,7 @@ async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depe
                                             ],
                                             "color": "blue",
                                             "zoom": 11,
-                                            "clima": clima_simple(collected_data)
+                                            "clima": "nublado"
                                         }
         estructura_clima_1_centros(collected_data)
     elif "pirquen_info" in collected_data:
@@ -277,7 +277,7 @@ async def analyze_question_endpoint(request: QuestionRequest, db: Session = Depe
                                             ],
                                             "color": "green",
                                             "zoom": 13,
-                                            "clima": clima_simple(collected_data)
+                                            "clima": "nublado"
                                         }
         estructura_clima_1_centros(collected_data)
     else:
