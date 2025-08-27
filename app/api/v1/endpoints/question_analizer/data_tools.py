@@ -971,4 +971,4 @@ class ToolExecutor:
             return {"count": len(result), "data": result}
         except Exception as e:
             logger.error(f"Error obteniendo datos de cosecha calculados: {e}")
-            return {"error": "Error al calcular los datos de cosecha."}
+            return {"error": "Error al calcular los datos de cosecha. "}
